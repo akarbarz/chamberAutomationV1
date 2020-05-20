@@ -1,0 +1,349 @@
+#include <Wire.h>
+
+// Preprocessor directives
+bool togglePressure();
+void reset();
+void hmiPressureReading ();
+int decStringToInt(String convert);
+float chamberPressure();
+void pressureMode(String targetPressure, int speed);
+
+/*Global variable initilization*/
+const int MAX_SIZE = 5;
+int check = -1;
+bool hold = false; // boolean flag for hold pressure
+int rampSpeed = 10; // ramp default is 10bar/min
+int lookup = -1;
+unsigned long holdCount = 0; // toggle hold or resume pressure
+int increasePressure = 0; // setDAC to 0 which = 0VDC = 4mA
+float decreasePressure = 2061;
+float prevPressure = 0;
+bool state = false; // false if in decrease mode, true if in increase mode
+
+// Timer variables
+unsigned long startMillis;
+unsigned long currentMillis;
+
+unsigned long displayStartMillis;
+unsigned long displayCurrentMillis;
+
+unsigned long startPressureMillis;
+unsigned long currentPressureMillis;
+
+unsigned long period = 1000; // 1 second
+
+
+MCP4725 dacIncrease; // Digital to analog converter to increase pressure
+MCP4725 dacDecrease; // Digital to analog to decrease pressure
+ADS1015 ads1015;     // 16 bit ADC, Range: +/- 6.144V (1 bit = 3mV)
+
+// Button IDs sent via hardwarserial2(in DEC format)
+// note: All button press event start with '101' all sent values sent start with '112'
+const String buttonID[MAX_SIZE] = {"1011502", "1011402", "1013100","1018212", "1016802" };
+/* Corresponding array pos
+   0 = Pressure up // Combined with pressure down within pressure() func
+   1 = Pressure down // Currently removed and combined within pressure()
+   2 = Hold pressure (toggle)
+   3 = Default/Reset
+   4 = Ramp screen enter
+*/
+const int buttonMeaning[MAX_SIZE] = {0, 1, 2, 3, 4};
+
+void setup() {
+  dacDecrease.begin(0x62);
+  dacIncrease.begin(0x63);
+  ads1015.begin();
+
+  /***************************************************************
+   * Set the value to true write the value to EEPROM
+   *  The values have NOT been set to for the DAC in charge of decreasing pressure
+   *  nor for the DAC in charge of increasing pressure
+   *  only uncomment the lines below if you would like to write to
+   * EEPROM. Note: EEPROM is only cable of 20,000 writes
+   * This SHOULD BE DONE AFTER TESTING
+   ****************************************************************/
+  // dacDecrease.setVoltage(2176.39, true);
+ //  dacIncrease.setVoltage(0, true)
+
+
+  dacIncrease.setVoltage(0, false); // 0 voltage corresponds to 4mA signal which signals no pressure increase
+  dacDecrease.setVoltage(2061, false); // ensure this is right its dec press signal
+  Serial2.begin(9600); // serial data in RX2, TX2
+  startMillis = millis();  // initial start time
+  displayStartMillis = millis();
+  startPressureMillis = millis();
+}
+
+void loop() {
+  getSerial();
+  hmiPressureReading();
+}
+
+// The purpose of this function is the read in serial data
+void getSerial() {
+  byte inByte;
+  String ID;
+  String subString;
+  String a ="";                 // initialize empty string
+  while (Serial2.available()) { // read in serial data from HMI
+    delay(2);                   // delay for serial buffer to receive next character
+    inByte = Serial2.read();
+    a += inByte;
+  }
+  subString = a.substring(0, 7); // get only the first 7 characters
+  // Check which button was pressed
+  for (int i = 0; i < MAX_SIZE; i++) {
+    if (subString == buttonID[i]) {
+      lookup = i; // store value of array index, corresponds to button
+    }
+  }
+
+  ID = a.substring(0, 3); // get first 3 characters from serial data
+  // Pressure up button pressed and target pressure entered
+  if (lookup == 0 && ID == "112") {
+    check = 0;
+    holdCount = 0;
+    if(state == false) {
+      period = 1000;
+    }
+    state = true;
+    decreasePressure = 2061;
+    dacDecrease.setVoltage(2061, false);
+    prevPressure = chamberPressure();
+    pressureMode(a, rampSpeed);
+  } else if (lookup == 1 && ID == "112") {  // Pressure down chosen and target entered
+    holdCount = 0;
+    increasePressure = 0;
+    if(state == true) {
+      period = 1000;
+    }
+    state = false;
+    check = 1;
+    dacIncrease.setVoltage(0, false);
+    prevPressure = chamberPressure();
+    pressureMode(a, rampSpeed);
+  } else if (lookup == 2 && ID == "101") { // Hold pressure button pressed
+     hold = togglePressure();
+     if (hold == true) {
+      lookup = -1;
+      check = 2;
+    } else {
+      lookup = -1;
+      check = 3;
+    }
+  } else if (lookup == 3 && ID == "101") { // Default/Reset button pressed
+    reset(); // resetting all flags
+  } else if (lookup == 4 && ID == "101") {   // User entered new ramp
+    rampSpeed = setRampSpeed(a);
+  }
+}
+
+// Takes in serial data and returns a human readabale value of the entered ramp speed
+int setRampSpeed(String targetRamp) {
+  String ramp = targetRamp;
+  String splitter;
+  splitter = targetRamp.substring(15, 31);
+  int speed = decStringToInt(splitter);
+  return speed;
+}
+
+// Handles all logic for increasing, decreasing, and holding pressure.
+void pressureMode(String targetPressure, int speed) {
+  int ramp = speed;
+  String b = targetPressure;
+  int target = decStringToInt(b);
+  float actualPressure = chamberPressure();
+  int prevCheck = -1;
+  float barPerSecond = (ramp/60.0);
+  unsigned long elapsedTime = 0;
+  float diff = 0.0;
+  float error = 0;
+  while (actualPressure != target) {
+    hmiPressureReading();
+    getSerial();
+    actualPressure = chamberPressure(); // get reading of the actual pressure in the chamber
+    if (check == 0) {
+      currentMillis = millis();  // get the current "time" (actually the number of milliseconds since the program started)
+      // test whether the period has elapsed. Period is 1 second
+      if (currentMillis - startMillis >= period) {
+        elapsedTime = currentMillis - startMillis;
+        period = 1000;                 // reset timer to 1 second
+        if (actualPressure - prevPressure <= barPerSecond) {
+         dacIncrease.setVoltage(increasePressure+=10, false);
+         startMillis = currentMillis;  // IMPORTANT to save the start time
+        } else if (actualPressure - prevPressure > barPerSecond) {
+           diff = actualPressure - prevPressure;
+           error = diff/barPerSecond;
+           period = (period*error);
+           dacIncrease.setVoltage(0, false);
+        } else { // safety check, if we get tot his point something went wrong, stop increasing pressure
+           dacIncrease.setVoltage(0, false);
+        }
+      }
+    } else if (check == 1) {     // Decrease pressure mode
+      currentMillis = millis();  // get the current "time" (actually the number of milliseconds since the program started)
+      // test whether the period has elapsed.
+      if (currentMillis - startMillis >= period) {
+        elapsedTime = currentMillis - startMillis;
+        period = 1000;
+        if (prevPressure - actualPressure  <= barPerSecond) {
+         dacDecrease.setVoltage(decreasePressure-= 5, false);
+         startMillis = currentMillis;  // IMPORTANT to save the start time
+        } else if (prevPressure - actualPressure > barPerSecond) {
+          diff = prevPressure - actualPressure;
+          error = (diff/barPerSecond);
+          period = (period*error);
+          dacDecrease.setVoltage(2061, false);
+          } else {
+            dacDecrease.setVoltage(2061, false);
+          }
+        }
+        // Hold pressure mode
+      } else if (check == 2) {
+        if(state == true) {
+          // stop increasing pressure, set mA output to 4ma
+          dacIncrease.setVoltage(0, false);
+        } else if (state == false) {
+          // stop decreasing, set mA output to 12mA
+        dacDecrease.setVoltage(2061, false);
+        }
+        // Resume pressure mode
+      } else if (check == 3) {
+        if(state == true) {
+          check = 0;
+        } else if (state == false){
+          check = 1;
+        }
+        // ramp changed
+    } else if (check == 5) {
+      ramp = rampSpeed;
+    }
+    if (state == true)
+    {
+      if (actualPressure >= target) {
+      dacIncrease.setVoltage(0, false);
+      return;
+      }
+    } else if (state == false) {
+      if (actualPressure <= target) {
+      dacDecrease.setVoltage(2061, false);
+      return;
+      }
+    }
+    currentPressureMillis = millis();
+    if(currentPressureMillis - startPressureMillis >= 2000)
+    {
+      prevPressure = actualPressure;
+      startPressureMillis = currentPressureMillis;
+    }
+
+  }
+}
+// Get the actual pressure of the chamber
+float chamberPressure()
+{
+  float volt;
+  float pressure;
+  float mA;
+  float adc0;
+
+  adc0 = ads1015.readADC_SingleEnded(0); // reading voltage in from 16 bit ADC, 1 bit = 3mV
+  volt = (3*adc0)/1000;
+  mA = (3.2 * volt) + 4; // convert voltage in to corresponing mA signal
+  pressure = (62.562 * mA) - 251.14; // convert mA signal to actual pressure of chamber in bar
+
+  return pressure;
+}
+
+void hmiPressureReading()
+{
+ float read = chamberPressure(); // if you only want whole numbers outputted change this to
+ displayCurrentMillis = millis();
+ if (displayCurrentMillis - displayStartMillis >= 1500)  // update pressure reading on display every 1.5 seconds
+  {
+   Serial2.print("input.txt=\""); // Changing the value of all txt boxes that should display the pressure
+   Serial2.print(read);
+   Serial2.print("\"");
+   Serial2.write(0xff);  // We always have to send this three lines after each command sent to the nextion display.
+   Serial2.write(0xff);
+   Serial2.write(0xff);
+
+   displayStartMillis = displayCurrentMillis;  // IMPORTANT to save the start time
+  }
+}
+
+
+bool togglePressure() {
+  holdCount += 1;
+  if (holdCount % 2 != 0) {
+    return true; // return true if hold button is pressed(in hold mode)
+  }
+
+  return false; // return false if in normal mode
+}
+
+// Serial data is passed into this function and it takes care of all the parsing and returns the correct value
+int decStringToInt(String convert) {
+  String splitter = convert;
+  int sub1 = 0; // substring holders
+  int sub2 = 0;
+  int sub3 = 0;
+  String stringHolder = "\0";
+  int converted = 0; // converted value to return(default 10)
+  int length = 0; // length of string passed in
+
+  length = splitter.length();
+  length -= 9; // position before (255,255,255)
+  splitter.remove(length); // remove the delimiters
+  splitter.remove(0, 3); // remove ID
+
+  length = splitter.length(); // get new length
+  switch (length) {
+    case 2: // 1 digit pressures and ramp speeds i.e. 1-9
+      converted = splitter.toInt();
+      converted -= 48; // convert to asci num
+      break;
+
+    case 4: // for 2 digit ramp speeds and pressures i.e 10-99
+      sub1 = splitter.substring(0, 2).toInt(); // get first two digits
+      sub2 = splitter.substring(2).toInt(); // get last two digits
+      sub1 -= 48; // convert integer from dec to ascii representation
+      sub2 -= 48;
+      converted = (sub1 * 10) + sub2; // concat together to get value
+      break;
+
+    case 6:   // 3 digit speeds and pressures 100-345 bar
+      sub1 = splitter.substring(0, 2).toInt(); // get first 2 digits
+      sub2 = splitter.substring(2, 4).toInt(); // get middle two digits
+      sub3 = splitter.substring(4).toInt(); // get last two digits
+      sub1 -= 48;
+      sub2 -= 48;
+      sub3 -= 48;
+      stringHolder += sub1;
+      stringHolder += sub2;
+      stringHolder += sub3;
+
+      converted = stringHolder.toInt();
+      break;
+  }
+  return converted;
+}
+
+// resets flags
+void reset() {
+
+check = -1;
+hold = false; // boolean flag for hold pressure
+rampSpeed = 10; // ramp default is 10bar/min
+lookup = -1;
+holdCount = 0; // toggle hold or resume pressure
+// Timer variables
+period = 1000; // 1 second
+increasePressure = 0; // setDAC to 0 which = 0VDC = 4mA
+decreasePressure = 2061;
+prevPressure = 0;
+bool state = false; // false if in decrease mode, true if in increase mode
+dacIncrease.setVoltage(0, false); // 0 voltage corresponds to 4mA signal which signals no pressure increase
+dacDecrease.setVoltage(2061, false);
+
+}
